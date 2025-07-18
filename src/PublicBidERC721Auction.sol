@@ -2,13 +2,12 @@
 pragma solidity ^0.8.20;
 
 /**
- * @title Public‑Bid ERC‑721 Auction (Updatable Bids)
- * @notice Transparent ascending auction where every bid is visible on‑chain.
- *         • Users can place **and increase** their bids before the deadline.
- *         • Zero‑value bids are rejected.
- *         • Helper `topBid()` exposes the leading bid.
- *         • Highest bidder at deadline wins the NFT; others can withdraw.
- *         • Extra safety: constructor checks NFT ownership, finalize blocked if no bids, and internal state reset after finalize.
+ * @title Public-Bid ERC-721 Auction (Updatable Bids, Auto-Finalize)
+ * @notice Transparent ascending auction where bids are visible and updatable.
+ *         • Users can place / increase bids until `bidDeadline`.
+ *         • Seller must own the NFT; zero-value bids are rejected.
+ *         • Auction can be finalized manually via `finalize()` *or* automatically
+ *           when any losing bidder calls `withdraw()` after the deadline.
  */
 
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
@@ -17,10 +16,9 @@ contract PublicBidERC721Auction {
     /* ───────────────────────────────────────────────────────────────
      * Immutable configuration
      * ──────────────────────────────────────────────────────────── */
-    address public immutable owner;    // seller / deployer
-    IERC721 public immutable nft;      // NFT contract
-    uint256 public immutable tokenId;  // Token being auctioned
-
+    address public immutable owner;     // seller / deployer
+    IERC721 public immutable nft;       // NFT contract
+    uint256 public immutable tokenId;   // Token being auctioned
     uint256 public immutable bidDeadline; // bidding phase end (unix time)
 
     /* ───────────────────────────────────────────────────────────────
@@ -42,37 +40,30 @@ contract PublicBidERC721Auction {
     /* ───────────────────────────────────────────────────────────────
      * Constructor
      * ──────────────────────────────────────────────────────────── */
-    constructor(
-        address _nft,
-        uint256 _tokenId,
-        uint256 _bidDuration
-    ) {
+    constructor(address _nft, uint256 _tokenId, uint256 _bidDuration) {
         owner = msg.sender;
         nft = IERC721(_nft);
         tokenId = _tokenId;
         bidDeadline = block.timestamp + _bidDuration;
 
-        // 1️⃣ Ensure the seller actually owns the NFT before auction starts.
+        // Ensure the seller actually owns the NFT before auction starts.
         require(nft.ownerOf(tokenId) == owner, "Seller must own the NFT");
     }
 
     /* ───────────────────────────────────────────────────────────────
-     * Helper: current top bid
+     * Helper: view current top bid
      * ──────────────────────────────────────────────────────────── */
     function topBid() external view returns (address bidder, uint256 amount) {
         return (highestBidder, highestBid);
     }
 
     /* ───────────────────────────────────────────────────────────────
-     * Place a new bid (initial or additional)
+     * Public bidding (initial or additional)
      * ──────────────────────────────────────────────────────────── */
     function bid() external payable {
         _updateBid(bids[msg.sender] + msg.value);
     }
 
-    /* ───────────────────────────────────────────────────────────────
-     * Explicitly set a higher total bid (must send the difference)
-     * ───────────────────────────────────────────────────────────── */
     function updateBid(uint256 newTotalBid) external payable {
         uint256 current = bids[msg.sender];
         require(newTotalBid > current, "New bid must be higher");
@@ -80,9 +71,6 @@ contract PublicBidERC721Auction {
         _updateBid(newTotalBid);
     }
 
-    /* ───────────────────────────────────────────────────────────────
-     * Internal bid logic (shared)
-     * ──────────────────────────────────────────────────────────── */
     function _updateBid(uint256 newTotal) internal {
         require(block.timestamp < bidDeadline, "Bidding period over");
         require(newTotal > 0, "Zero bid not allowed");
@@ -99,32 +87,45 @@ contract PublicBidERC721Auction {
     }
 
     /* ───────────────────────────────────────────────────────────────
-     * Finalize after deadline
+     * Finalization logic
      * ──────────────────────────────────────────────────────────── */
+
+    /// Manually finalize - callable by anyone after deadline
     function finalize() external {
+        _doFinalize();
+    }
+
+    /// Internal finalize implementation, reused by auto-finalize
+    function _doFinalize() private {
         require(block.timestamp >= bidDeadline, "Auction still ongoing");
         require(!finalized, "Already finalized");
-        require(highestBidder != address(0), "No bids placed"); // 3️⃣ Block finalize when no bids
+        require(highestBidder != address(0), "No bids placed");
+
         finalized = true;
 
-        // Transfer NFT to winner.
+        // Transfer NFT to winner
         nft.transferFrom(owner, highestBidder, tokenId);
 
-        // Pay seller the winning bid.
+        // Pay seller
         (bool ok, ) = owner.call{value: highestBid}("");
         require(ok, "Owner payout failed");
 
         emit Finalized(highestBidder, highestBid);
 
-        // 2️⃣ Reset state to avoid stale data after finalize
+        // Optional: reset highestBid/ Bidder to avoid stale state
         highestBidder = address(0);
         highestBid = 0;
     }
 
     /* ───────────────────────────────────────────────────────────────
-     * Withdraw for losing bidders
+     * Withdraw refunds for losing bidders (auto-finalize if needed)
      * ──────────────────────────────────────────────────────────── */
     function withdraw() external {
+        // Auto-finalize if auction ended, not yet finalized, and there was a bid
+        if (!finalized && block.timestamp >= bidDeadline && highestBidder != address(0)) {
+            _doFinalize();
+        }
+
         require(finalized, "Not finalized");
         require(msg.sender != highestBidder, "Winner cannot withdraw");
 
